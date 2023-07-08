@@ -1,5 +1,6 @@
 import os
 
+import torch
 from torch import nn
 from torch import optim
 from torch.optim.lr_scheduler import MultiStepLR
@@ -11,16 +12,18 @@ import click
 import numpy as np
 
 from pspnet import PSPNet
+from imgSegLoader import data_loader
 
+n_classes = 19
 
 models = {
-    'squeezenet': lambda: PSPNet(sizes=(1, 2, 3, 6), psp_size=512, deep_features_size=256, backend='squeezenet'),
-    'densenet': lambda: PSPNet(sizes=(1, 2, 3, 6), psp_size=1024, deep_features_size=512, backend='densenet'),
-    'resnet18': lambda: PSPNet(sizes=(1, 2, 3, 6), psp_size=512, deep_features_size=256, backend='resnet18'),
-    'resnet34': lambda: PSPNet(sizes=(1, 2, 3, 6), psp_size=512, deep_features_size=256, backend='resnet34'),
-    'resnet50': lambda: PSPNet(sizes=(1, 2, 3, 6), psp_size=2048, deep_features_size=1024, backend='resnet50'),
-    'resnet101': lambda: PSPNet(sizes=(1, 2, 3, 6), psp_size=2048, deep_features_size=1024, backend='resnet101'),
-    'resnet152': lambda: PSPNet(sizes=(1, 2, 3, 6), psp_size=2048, deep_features_size=1024, backend='resnet152')
+    'squeezenet': lambda: PSPNet(n_classes=n_classes, sizes=(1, 2, 3, 6), psp_size=512, deep_features_size=256, backend='squeezenet'),
+    'densenet': lambda: PSPNet(n_classes=n_classes, sizes=(1, 2, 3, 6), psp_size=1024, deep_features_size=512, backend='densenet'),
+    'resnet18': lambda: PSPNet(n_classes=n_classes, sizes=(1, 2, 3, 6), psp_size=512, deep_features_size=256, backend='resnet18'),
+    'resnet34': lambda: PSPNet(n_classes=n_classes, sizes=(1, 2, 3, 6), psp_size=512, deep_features_size=256, backend='resnet34'),
+    'resnet50': lambda: PSPNet(n_classes=n_classes, sizes=(1, 2, 3, 6), psp_size=2048, deep_features_size=1024, backend='resnet50'),
+    'resnet101': lambda: PSPNet(n_classes=n_classes, sizes=(1, 2, 3, 6), psp_size=2048, deep_features_size=1024, backend='resnet101'),
+    'resnet152': lambda: PSPNet(n_classes=n_classes, sizes=(1, 2, 3, 6), psp_size=2048, deep_features_size=1024, backend='resnet152')
 }
 
 
@@ -33,7 +36,7 @@ def build_network(snapshot, backend):
         _, epoch = os.path.basename(snapshot).split('_')
         epoch = int(epoch)
         net.load_state_dict(torch.load(snapshot))
-        logging.info("Snapshot for epoch {} loaded from {}".format(epoch, snapshot))
+        print("Snapshot for epoch {} loaded from {}".format(epoch, snapshot))
     net = net.cuda()
     return net, epoch
 
@@ -51,7 +54,8 @@ def build_network(snapshot, backend):
 @click.option('--gpu', type=str, default='0', help='List of GPUs for parallel training, e.g. 0,1,2,3')
 @click.option('--start-lr', type=float, default=0.001)
 @click.option('--milestones', type=str, default='10,20,30', help='Milestones for LR decreasing')
-def train(data_path, models_path, backend, snapshot, crop_x, crop_y, batch_size, alpha, epochs, start_lr, milestones, gpu):
+@click.option('--max_steps', type=int, default=100000, help='Max step')
+def train(data_path, models_path, backend, snapshot, crop_x, crop_y, batch_size, alpha, epochs, start_lr, milestones, gpu, max_steps):
     os.environ["CUDA_VISIBLE_DEVICES"] = gpu
     net, starting_epoch = build_network(snapshot, backend)
     data_path = os.path.abspath(os.path.expanduser(data_path))
@@ -66,27 +70,30 @@ def train(data_path, models_path, backend, snapshot, crop_x, crop_y, batch_size,
         y_cls - batch of 1D tensors of dimensionality N: N total number of classes, 
         y_cls[i, T] = 1 if class T is present in image i, 0 otherwise
     '''
-    train_loader, class_weights, n_images = None, None, None
+    train_loader, class_weights, n_images = data_loader(data_path, 100, batch_size, True), torch.ones(19, dtype=torch.float).cuda(), None
     
     optimizer = optim.Adam(net.parameters(), lr=start_lr)
     scheduler = MultiStepLR(optimizer, milestones=[int(x) for x in milestones.split(',')])
-    
+    steps = 0
+
     for epoch in range(starting_epoch, starting_epoch + epochs):
-        seg_criterion = nn.NLLLoss2d(weight=class_weights)
+        seg_criterion = nn.NLLLoss(weight=class_weights)
         cls_criterion = nn.BCEWithLogitsLoss(weight=class_weights)
         epoch_losses = []
-        train_iterator = tqdm(loader, total=max_steps // batch_size + 1)
+        train_iterator = tqdm(train_loader, total=len(train_loader))
         net.train()
         for x, y, y_cls in train_iterator:
             steps += batch_size
             optimizer.zero_grad()
             x, y, y_cls = Variable(x).cuda(), Variable(y).cuda(), Variable(y_cls).cuda()
             out, out_cls = net(x)
-            seg_loss, cls_loss = seg_criterion(out, y), cls_criterion(out_cls, y_cls)
+            seg_loss = seg_criterion(out, y)
+            cls_loss = cls_criterion(out_cls, y_cls)
             loss = seg_loss + alpha * cls_loss
-            epoch_losses.append(loss.data[0])
-            status = '[{0}] loss = {1:0.5f} avg = {2:0.5f}, LR = {5:0.7f}'.format(
-                epoch + 1, loss.data[0], np.mean(epoch_losses), scheduler.get_lr()[0])
+            loss = loss.cpu()
+            epoch_losses.append(loss.data)
+            status = '[{0}] loss = {1:0.5f} avg = {2:0.5f}, LR = {3:0.7f}'.format(
+                epoch + 1, loss.data, np.mean(epoch_losses), scheduler.get_lr()[0])
             train_iterator.set_description(status)
             loss.backward()
             optimizer.step()
